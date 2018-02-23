@@ -137,10 +137,18 @@ var _ = utilities.NewDoubleArray
 
 	handlerTemplate = template.Must(template.New("handler").Parse(`
 {{if and .Method.GetClientStreaming .Method.GetServerStreaming}}
+{{template "bidi-streaming-call-func" .}}
 {{template "bidi-streaming-request-func" .}}
 {{else if .Method.GetClientStreaming}}
+{{template "client-streaming-call-func" .}}
 {{template "client-streaming-request-func" .}}
 {{else}}
+{{if .HasQueryParam}}
+var (
+	filter_{{.Method.Service.GetName}}_{{.Method.GetName}}_{{.Index}} = {{.QueryParamFilter}}
+)
+{{end}}
+{{template "client-rpc-call-func" .}}
 {{template "client-rpc-request-func" .}}
 {{end}}
 `))
@@ -151,6 +159,13 @@ func request_{{.Method.Service.GetName}}_{{.Method.GetName}}_{{.Index}}(ctx cont
 {{else}}
 func request_{{.Method.Service.GetName}}_{{.Method.GetName}}_{{.Index}}(ctx context.Context, marshaler runtime.Marshaler, client {{.Method.Service.GetName}}Client, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error)
 {{end}}`, "\n", "", -1)))
+
+	_ = template.Must(handlerTemplate.New("call-func-signature").Parse(strings.Replace(`
+	{{if .Method.GetServerStreaming}}
+	func call_{{.Method.Service.GetName}}_{{.Method.GetName}}_{{.Index}}(ctx context.Context, marshaler runtime.Marshaler, srv {{.Method.Service.GetName}}Server, req *http.Request, pathParams map[string]string) ({{.Method.Service.GetName}}_{{.Method.GetName}}Server, runtime.ServerMetadata, error)
+	{{else}}
+	func call_{{.Method.Service.GetName}}_{{.Method.GetName}}_{{.Index}}(ctx context.Context, marshaler runtime.Marshaler, srv {{.Method.Service.GetName}}Server, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error)
+	{{end}}`, "\n", "", -1)))
 
 	_ = template.Must(handlerTemplate.New("client-streaming-request-func").Parse(`
 {{template "request-func-signature" .}} {
@@ -197,12 +212,52 @@ func request_{{.Method.Service.GetName}}_{{.Method.GetName}}_{{.Index}}(ctx cont
 }
 `))
 
+	_ = template.Must(handlerTemplate.New("client-streaming-call-func").Parse(`
+	{{template "call-func-signature" .}} {
+		var metadata runtime.ServerMetadata
+		stream, err := srv.{{.Method.GetName}}(ctx)
+		if err != nil {
+			grpclog.Printf("Failed to start streaming: %v", err)
+			return nil, metadata, err
+		}
+		dec := marshaler.NewDecoder(req.Body)
+		for {
+			var protoReq {{.Method.RequestType.GoType .Method.Service.File.GoPkg.Path}}
+			err = dec.Decode(&protoReq)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				grpclog.Printf("Failed to decode request: %v", err)
+				return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+			}
+			if err = stream.Send(&protoReq); err != nil {
+				grpclog.Printf("Failed to send request: %v", err)
+				return nil, metadata, err
+			}
+		}
+	
+		if err := stream.CloseSend(); err != nil {
+			grpclog.Printf("Failed to terminate client stream: %v", err)
+			return nil, metadata, err
+		}
+		header, err := stream.Header()
+		if err != nil {
+			grpclog.Printf("Failed to get header from client: %v", err)
+			return nil, metadata, err
+		}
+		metadata.HeaderMD = header
+	{{if .Method.GetServerStreaming}}
+		return stream, metadata, nil
+	{{else}}
+		msg, err := stream.CloseAndRecv()
+		metadata.TrailerMD = stream.Trailer()
+		return msg, metadata, err
+	{{end}}
+	}
+	`))
+
 	_ = template.Must(handlerTemplate.New("client-rpc-request-func").Parse(`
-{{if .HasQueryParam}}
-var (
-	filter_{{.Method.Service.GetName}}_{{.Method.GetName}}_{{.Index}} = {{.QueryParamFilter}}
-)
-{{end}}
 {{template "request-func-signature" .}} {
 	var protoReq {{.Method.RequestType.GoType .Method.Service.File.GoPkg.Path}}
 	var metadata runtime.ServerMetadata
@@ -311,6 +366,115 @@ var (
 }
 `))
 
+	_ = template.Must(handlerTemplate.New("client-rpc-call-func").Parse(`
+	{{template "call-func-signature" .}} {
+		var protoReq {{.Method.RequestType.GoType .Method.Service.File.GoPkg.Path}}
+		var metadata runtime.ServerMetadata
+	{{if .Body}}
+		if req.ContentLength > 0 {
+			if err := marshaler.NewDecoder(req.Body).Decode(&{{.Body.RHS "protoReq"}}); err != nil {
+				return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+			}
+		}
+	{{end}}
+	{{if .PathParams}}
+		var (
+			val string
+			ok bool
+			err error
+			_ = err
+		)
+		{{range $param := .PathParams}}
+		val, ok = pathParams[{{$param | printf "%q"}}]
+		if !ok {
+			return nil, metadata, status.Errorf(codes.InvalidArgument, "missing parameter %s", {{$param | printf "%q"}})
+		}
+	{{if $param.IsNestedProto3 }}
+		err = runtime.PopulateFieldFromPath(&protoReq, {{$param | printf "%q"}}, val)
+	{{else}}
+		{{$param.RHS "protoReq"}}, err = {{$param.ConvertFuncExpr}}(val)
+	{{end}}
+		if err != nil {
+			return nil, metadata, status.Errorf(codes.InvalidArgument, "type mismatch, parameter: %s, error: %v", {{$param | printf "%q"}}, err)
+		}
+		{{end}}
+	{{end}}
+	{{if .HasQueryParam}}
+		if err := runtime.PopulateQueryParameters(&protoReq, req.URL.Query(), filter_{{.Method.Service.GetName}}_{{.Method.GetName}}_{{.Index}}); err != nil {
+			return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+		}
+	{{end}}
+	{{if .Method.GetServerStreaming}}
+		stream, err := srv.{{.Method.GetName}}(ctx, &protoReq)
+		if err != nil {
+			return nil, metadata, err
+		}
+		header, err := stream.Header()
+		if err != nil {
+			return nil, metadata, err
+		}
+		metadata.HeaderMD = header
+		return stream, metadata, nil
+	{{else}}
+		msg, err := srv.{{.Method.GetName}}(ctx, &protoReq)
+		return msg, metadata, err
+	{{end}}
+	}`))
+
+	_ = template.Must(handlerTemplate.New("bidi-streaming-call-func").Parse(`
+	{{template "call-func-signature" .}} {
+		var metadata runtime.ServerMetadata
+		stream, err := client.{{.Method.GetName}}(ctx)
+		if err != nil {
+			grpclog.Printf("Failed to start streaming: %v", err)
+			return nil, metadata, err
+		}
+		dec := marshaler.NewDecoder(req.Body)
+		handleSend := func() error {
+			var protoReq {{.Method.RequestType.GoType .Method.Service.File.GoPkg.Path}}
+			err = dec.Decode(&protoReq)
+			if err == io.EOF {
+				return err
+			}
+			if err != nil {
+				grpclog.Printf("Failed to decode request: %v", err)
+				return err
+			}
+			if err = stream.Send(&protoReq); err != nil {
+				grpclog.Printf("Failed to send request: %v", err)
+				return err
+			}
+			return nil
+		}
+		if err := handleSend(); err != nil {
+			if cerr := stream.CloseSend(); cerr != nil {
+				grpclog.Printf("Failed to terminate client stream: %v", cerr)
+			}
+			if err == io.EOF {
+				return stream, metadata, nil
+			}
+			return nil, metadata, err
+		}
+		go func() {
+			for {
+				if err := handleSend(); err != nil {
+					break
+				}
+			}
+			if err := stream.CloseSend(); err != nil {
+				grpclog.Printf("Failed to terminate client stream: %v", err)
+			}
+		}()
+		header, err := stream.Header()
+		if err != nil {
+			grpclog.Printf("Failed to get header from client: %v", err)
+			return nil, metadata, err
+		}
+		metadata.HeaderMD = header
+		return stream, metadata, nil
+	}
+	`))
+
 	trailerTemplate = template.Must(template.New("trailer").Parse(`
 {{$UseRequestContext := .UseRequestContext}}
 {{range $svc := .Services}}
@@ -376,6 +540,53 @@ func Register{{$svc.GetName}}HandlerClient(ctx context.Context, mux *runtime.Ser
 			return
 		}
 		resp, md, err := request_{{$svc.GetName}}_{{$m.GetName}}_{{$b.Index}}(rctx, inboundMarshaler, client, req, pathParams)
+		ctx = runtime.NewServerMetadataContext(ctx, md)
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		{{if $m.GetServerStreaming}}
+		forward_{{$svc.GetName}}_{{$m.GetName}}_{{$b.Index}}(ctx, mux, outboundMarshaler, w, req, func() (proto.Message, error) { return resp.Recv() }, mux.GetForwardResponseOptions()...)
+		{{else}}
+		forward_{{$svc.GetName}}_{{$m.GetName}}_{{$b.Index}}(ctx, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+		{{end}}
+	})
+	{{end}}
+	{{end}}
+	return nil
+}
+
+// Register{{$svc.GetName}}Handler registers the http handlers for service {{$svc.GetName}} to "mux".
+// The handlers transfer http into grpc over the given implementation of "{{$svc.GetName}}Server".
+// Note: the gRPC framework executes interceptors within the gRPC handler. If the passed in "{{$svc.GetName}}Server"
+// doesn't go through the normal gRPC flow (creating a gRPC server etc.) then it will be up to the passed in
+// "{{$svc.GetName}}Server" to call the correct interceptors.
+func Register{{$svc.GetName}}HandlerServer(ctx context.Context, mux *runtime.ServeMux, srv {{$svc.GetName}}Server) error {
+	{{range $m := $svc.Methods}}
+	{{range $b := $m.Bindings}}
+	mux.Handle({{$b.HTTPMethod | printf "%q"}}, pattern_{{$svc.GetName}}_{{$m.GetName}}_{{$b.Index}}, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+	{{- if $UseRequestContext }}
+		ctx, cancel := context.WithCancel(req.Context())
+	{{- else -}}
+		ctx, cancel := context.WithCancel(ctx)
+	{{- end }}
+		defer cancel()
+		if cn, ok := w.(http.CloseNotifier); ok {
+			go func(done <-chan struct{}, closed <-chan bool) {
+				select {
+				case <-done:
+				case <-closed:
+					cancel()
+				}
+			}(ctx.Done(), cn.CloseNotify())
+		}
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		rctx, err := runtime.AnnotateIncomingContext(ctx, mux, req)
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := call_{{$svc.GetName}}_{{$m.GetName}}_{{$b.Index}}(rctx, inboundMarshaler, srv, req, pathParams)
 		ctx = runtime.NewServerMetadataContext(ctx, md)
 		if err != nil {
 			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)

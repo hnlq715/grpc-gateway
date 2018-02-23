@@ -97,6 +97,66 @@ func AnnotateContext(ctx context.Context, mux *ServeMux, req *http.Request) (con
 	return metadata.NewOutgoingContext(ctx, md), nil
 }
 
+/*
+AnnotateIncomingContext adds context information such as metadata from the request.
+
+At a minimum, the RemoteAddr is included in the fashion of "X-Forwarded-For",
+except that the forwarded destination is not another HTTP service but rather
+a gRPC service.
+*/
+func AnnotateIncomingContext(ctx context.Context, mux *ServeMux, req *http.Request) (context.Context, error) {
+	var pairs []string
+	timeout := DefaultContextTimeout
+	if tm := req.Header.Get(metadataGrpcTimeout); tm != "" {
+		var err error
+		timeout, err = timeoutDecode(tm)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid grpc-timeout: %s", tm)
+		}
+	}
+
+	for key, vals := range req.Header {
+		for _, val := range vals {
+			// For backwards-compatibility, pass through 'authorization' header with no prefix.
+			if strings.ToLower(key) == "authorization" {
+				pairs = append(pairs, "authorization", val)
+			}
+			if h, ok := mux.incomingHeaderMatcher(key); ok {
+				pairs = append(pairs, h, val)
+			}
+		}
+	}
+	if host := req.Header.Get(xForwardedHost); host != "" {
+		pairs = append(pairs, strings.ToLower(xForwardedHost), host)
+	} else if req.Host != "" {
+		pairs = append(pairs, strings.ToLower(xForwardedHost), req.Host)
+	}
+
+	if addr := req.RemoteAddr; addr != "" {
+		if remoteIP, _, err := net.SplitHostPort(addr); err == nil {
+			if fwd := req.Header.Get(xForwardedFor); fwd == "" {
+				pairs = append(pairs, strings.ToLower(xForwardedFor), remoteIP)
+			} else {
+				pairs = append(pairs, strings.ToLower(xForwardedFor), fmt.Sprintf("%s, %s", fwd, remoteIP))
+			}
+		} else {
+			grpclog.Printf("invalid remote addr: %s", addr)
+		}
+	}
+
+	if timeout != 0 {
+		ctx, _ = context.WithTimeout(ctx, timeout)
+	}
+	if len(pairs) == 0 {
+		return ctx, nil
+	}
+	md := metadata.Pairs(pairs...)
+	if mux.metadataAnnotator != nil {
+		md = metadata.Join(md, mux.metadataAnnotator(ctx, req))
+	}
+	return metadata.NewIncomingContext(ctx, md), nil
+}
+
 // ServerMetadata consists of metadata sent from gRPC server.
 type ServerMetadata struct {
 	HeaderMD  metadata.MD
